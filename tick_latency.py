@@ -1,37 +1,48 @@
-
-# Data on drive - "tcaFixnetTicks"
-
-from dash import Dash, dcc, html
-from datetime import datetime
+from dash import Dash, dcc, html, Input, Output
 import plotly.express as px
+from decimal import Decimal
+import numpy as np
 import pandas as pd
+import os.path
+import sys
 import csv
+import io
 
-def epoch_convert_and_format(x, return_time=True):
-    # Divide by 1m otherwise cant convert to datetime
-    time = str(datetime.fromtimestamp(int(row[row.index(item)].split(':')[1]) / 1_000_000))
 
-    if return_time == True: # Return the time formatted. Every second
-        time = time.split(' ')[1]
-        time = time.split('.')[0]
-        return time
+# Split at decimal to remove ms
+def epoch_format(item, make_seconds=False):
+    time = float(str(item).split(':')[1])
+    if make_seconds:
+        time = (float(str(time).split('.')[0]))
+    return time
 
-    else: # Returns seconds and ms as (10.627) format
-        time = time.split(' ')[1]
-        time = time.split(':')[2]
-        return float(time)
+
+def minutes_format(row):
+    row = str(row).split('.')[0]
+    print(row)
+    return
+
+
+def format_ms(row):
+    row = str(str(row).split('.')[0]) + 'ms'
+    return row
+
 
 # Dash Init
-
 app = Dash(__name__)
 
+# I/O - For writing to html and download
+buffer = io.StringIO()
+
+colors = {
+    'background': 'rgba(196, 225, 255, 0.6)',
+    'plot_bg': 'rgba(247, 251, 255, 1)',
+    'text': 'rgb(250,250,250)'}
+
 # CSV
+data = {'appTime': [], 'tickSource': [], 'eventDateTime': [], 'eventStamp': [], 'tickStamp': []}
 
-data = {'time': [], 'eventTime': [], 'tickTime': []}
-
-
-with open('/home/anthoy/code/python/dataTest/data/tcaFixnetTicks.log') as file:
-
+with open('data/AsiaTicks.log_backup') as file:
     file_reader = csv.reader(file)
 
     iteration = 0
@@ -40,70 +51,175 @@ with open('/home/anthoy/code/python/dataTest/data/tcaFixnetTicks.log') as file:
 
         iteration += 1
 
-        # print(row[0])
-
-        for item in row: # Add vendor it came from as two lines wip
-
-            if 'EVENT_TIME' in item:
-                data['time'].append(epoch_convert_and_format(item))
-                data['eventTime'].append(epoch_convert_and_format(item, False))
-
-            if 'tick_stamp' in item:
-                data['tickTime'].append(epoch_convert_and_format(item, False))
+        for item in row:
 
             if 'tickSource' in item:
-                pass
+                data['tickSource'].append(item.split(':')[1])
 
-        # if iteration == 100_000:
-        #     break
+            if 'EVENT_TIME' in item:
+                data['appTime'].append(row[0].split(',')[0])
+                data['eventDateTime'].append(epoch_format(item, True))
+                data['eventStamp'].append(epoch_format(item))
 
-# Dataframe
+            if 'tick_stamp' in item:
+                data['tickStamp'].append(epoch_format(item))
 
-df = pd.DataFrame(data)
+        if iteration == 500_000:
+            break
 
-df.sort_values(by=['time'], inplace=True)
+# Total Dataframe
+total_df = pd.DataFrame(data)
+pd.set_option('display.max_rows', 1000)
+total_df.sort_values(by=['eventDateTime'], inplace=True)
 
-df['latency_ms'] = abs(df['eventTime'] - df['tickTime'])
+# Make datetime with microsecond epoch / round eventDateTime to minutes
+total_df['eventDateTime'] = pd.to_datetime(total_df['eventDateTime'], origin='unix', unit='us')
+total_df['eventDateTime'] = total_df['eventDateTime'].dt.round('min')
+total_df['eventStamp'] = pd.to_datetime(total_df['eventStamp'], origin='unix', unit='us')
+total_df['tickStamp'] = pd.to_datetime(total_df['tickStamp'], origin='unix', unit='us')
 
-# Time uniques
+# Calculate Time Differences / Total seconds * 1000 to ms
+total_df['timeDiff'] = abs(total_df.eventStamp - total_df.tickStamp)
+total_df['timeDiff'] = total_df.timeDiff.apply(lambda row: Decimal(row.total_seconds()) * 1000)
 
-times = df['time'].unique()
+# Get years so can check for 1970 fakes
+total_df['year'] = total_df['eventDateTime'].apply(lambda row: str(row).split('-')[0])
 
-result_df = pd.DataFrame({ 'time': [], 'max_latency': [] })
+# Drop unwanted
+total_df.drop(total_df[total_df['tickSource'] == 'reuters_heartbeat'].index, inplace=True)
+total_df.drop(total_df[total_df['timeDiff'] > 1500].index, inplace=True)  # 5_000 - 5 seconds
+total_df.drop(total_df[total_df['year'] == '1970'].index, inplace=True)
 
-# For each time, find max latency
+# Unique Sources
+tickSources = [source for source in total_df['tickSource'].unique()]
 
-for time in times:
-    max_latency = max(df.loc[df['time'] == time, 'latency_ms'])
+# Final Dataframe
+dataFrames = pd.DataFrame()
 
-    # drop from original for faster searching?
-    df.drop(df[df['time'] == time].index, inplace=True)
+# Organise each sources respective data - eg: bloomberg etc.
+for source in tickSources:
 
-    temp = pd.DataFrame([{'time': time, 'max_latency': max_latency}])
+    # Source data
+    sourceTimes = total_df.loc[total_df['tickSource'] == source, 'eventDateTime']
+    sourceTimeDifference = total_df.loc[total_df['tickSource'] == source, 'timeDiff']
 
-    result_df = pd.concat([result_df, temp])
+    # Source dataframe
+    source_data = {'eventDateTime': sourceTimes, 'timeDiff': sourceTimeDifference}
+    source_df = pd.DataFrame(source_data)
 
-# Dash - Plotly
+    # For each unique time, get the stamps and find max latency
+    for time in source_df['eventDateTime'].unique():
 
-fig = px.line( result_df, x='time', y='max_latency',
-               labels={
-                   'time': 'Time',
-                   'max_latency': 'Latency (ms)'
-               })
+        # Pull time differences within second
+        timeDiffs = source_df.loc[source_df['eventDateTime'] == time, 'timeDiff']
 
-# Layout
+        # Latency
+        maxLatency = timeDiffs.max()
 
-app.layout = html.Div(children=[
-    html.H1(children='Attempt'),
+        # Symbol Format
+        if '_' in source:
+            source = source.split('_')
+            source = ' '.join(source)
 
-    html.P(children='Latency plot'),
+        source = source.capitalize()
 
-    dcc.Graph(
-        id='latency_graph',
-        figure=fig
-    )
+        # Percentiles
+        percentile_range = range(50, 101, 5)
+        floatTimeDiffs = timeDiffs.apply(lambda row: float(row)).to_numpy()
+
+        # Adding percentiles / We use range 100 as the 99 trigger
+        for percentile in percentile_range:
+            percentile_value = np.percentile(floatTimeDiffs, percentile)
+
+            if percentile == 100:
+                percentile = 99
+                percentile_value = np.percentile(floatTimeDiffs, percentile)
+
+            finishedSource = {'time': time, 'max_latency': maxLatency, 'symbol': source, 'value': percentile_value,
+                              'percentile': percentile}
+
+            # Concat Row of data to main dataFrames
+            finishedSource = pd.DataFrame([finishedSource])
+            dataFrames = pd.concat([dataFrames, finishedSource])
+
+# Figures / Percentile / Max
+figures = {'percentile_fig': px.line(dataFrames, x='time', y='value', color='symbol', line_group='percentile',
+                                     line_shape='spline',
+                                     labels={
+                                         'time': 'Time (s)',
+                                         'value': 'Percentile Latency (ms)',
+                                     }),
+           'max_fig': px.line(dataFrames, x='time', y='max_latency', color='symbol', line_shape='spline',
+                              labels={
+                                  'time': 'Time (s)',
+                                  'max_latency': 'Max Latency (ms)',
+                              })}
+
+# Sort by time
+dataFrames.sort_values(by=['time'], inplace=True)
+
+# Dash Layout
+app.layout = html.Div(id='main_div', style={'backgroundColor': colors['background'], 'padding': '20px',
+                                            'fontFamily': 'Arial'}, children=[
+
+    html.H1(style={'margin': '50px'}, id='plot_header', children=['Latency Plot']),
+
+    html.Br(),
+
+    html.Div(style={'display': 'flex', 'justify-content': 'space-between'}, children=[
+
+        html.Div(style={'display': 'inline-block'}, children=[
+            dcc.Checklist(id='percentile_switch', options=[{'label': 'Percentile', 'value': True}])]),
+
+        html.Div(style={'display': 'inline-block'}, id='percentile_checklist', children=[
+            dcc.Checklist(id='percentile_options')
+        ])
+
+    ]),
+
+    dcc.Graph(id='latency_graph'),
+
+    html.A(html.Button("Download as HTML"), id="download_button"),
 ])
+
+
+# Change Chart Mode
+@app.callback(
+    Output('latency_graph', 'figure'),
+    Output('percentile_checklist', 'children'),
+    Input('percentile_switch', 'value'),
+    Input('percentile_options', 'value'))
+def selected_mode(percentile_switch, percentile_options):  # Change to percentile
+    if percentile_switch:
+        options = dcc.Checklist(id='percentile_options', options=sorted(dataFrames.percentile.unique()),
+                                value=[x for x in dataFrames.percentile.unique()])
+        fig = figures['percentile_fig']
+        fig.update_layout(plot_bgcolor=colors['plot_bg'], paper_bgcolor=colors['background'])
+        return fig, options
+    fig = figures['max_fig']
+    fig.update_layout(plot_bgcolor=colors['plot_bg'], paper_bgcolor=colors['background'])
+    return fig, None
+def percentile_options(percentile_switch, percentile_options):
+    if percentile_options:
+        print(percentile_options)
+
+
+# Download HTML Charts / Encode each figure, and write in bytes to file
+@app.callback(
+    Output('download_button', 'children'),
+    Input('download_button', 'n_clicks'))
+def download_graphs(n_clicks):
+    if n_clicks:
+        if not os.path.isfile('plotly_graph.html'):
+            f = open('plotly_graph.html', 'w')
+            f.close()
+        with(open('plotly_graph.html', 'r+b')) as f:
+            for fig in figures.values():
+                fig.update_layout(plot_bgcolor=colors['plot_bg'], paper_bgcolor=colors['background'])
+                fig.write_html(buffer)  # Not entirely sure how this works, I kinda made it up
+            html_bytes = buffer.getvalue().encode()
+            f.write(html_bytes)
+
 
 if __name__ == '__main__':
     app.run_server(debug=True)
-
